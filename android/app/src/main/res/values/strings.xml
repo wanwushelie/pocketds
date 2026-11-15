@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">DS Chat</string>
-    <string name="title_activity_main">DS Chat</string>
+    <string name="app_name">PocketDS</string>
+    <string name="title_activity_main">PocketDS</string>
     <string name="package_name">com.chatdemo.webui</string>
     <string name="custom_url_scheme">com.chatdemo.webui</string>
 </resources>

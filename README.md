@@ -1,4 +1,4 @@
-# DSWeb — DeepSeek Chat Demo 多端壳
+# PocketDS — DeepSeek 官网聊天 Demo 的本地全端版
 
 基于 [deepseek-ai/chat-demo](https://github.com/deepseek-ai/chat-demo)（MIT，React 18 + rspack）的
 **Capacitor 原生壳工程**：网页成品零重写，套原生容器出移动端安装包。

@@ -1,7 +1,7 @@
 {
-  "name": "dsweb",
+  "name": "pocketds",
   "version": "0.1.1",
-  "description": "DeepSeek chat-demo 的 Capacitor 多端壳（Android 已验证，iOS/鸿蒙规划中）",
+  "description": "DeepSeek 官网聊天 Demo 的本地全端版（Android 已验证；iOS/鸿蒙/Electron 规划中）",
   "private": true,
   "type": "commonjs",
   "scripts": {
