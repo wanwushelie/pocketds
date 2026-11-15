@@ -11,6 +11,7 @@ import {
   readEntry,
   skipEntry,
   type ArchiveEntry,
+  type ZipSource,
 } from './zipReader.js'
 
 /** 从原件字节补充图片 MIME；无法识别时为空字符串，图片身份仍由归档的 is_image 决定。 */
@@ -54,12 +55,12 @@ const readJson = async (entry: ArchiveEntry): Promise<unknown> => {
  * 检查 ZIP 格式、首个 manifest 条目及格式版本。
  * 校验失败时保留正在生成的回答和现有暂存数据。
  */
-export const checkArchiveFormat = async (file: File): Promise<void> => {
-  if (!(await isZipFile(file))) {
+export const checkArchiveFormat = async (source: ZipSource): Promise<void> => {
+  if (!(await isZipFile(source))) {
     fail('backupUnrecognized')
   }
   try {
-    for await (const entry of readArchive(file)) {
+    for await (const entry of readArchive(source)) {
       if (entry.path !== MANIFEST_PATH) {
         fail('backupUnrecognized')
       }
@@ -78,8 +79,14 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
  * 会话读完立即暂存，只保留图片路径映射；图片全部读完后逐会话回填 MIME，不改变图片身份。
  * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
  */
-export const importArchive = async (file: File): Promise<void> => {
-  if (!(await isZipFile(file))) {
+/** 导入进度：已解析会话数、已保存图片数、按字节估算的百分比 */
+export type ImportProgress = { sessions: number; images: number; percent: number }
+
+export const importArchive = async (
+  source: ZipSource,
+  onProgress?: (progress: ImportProgress) => void
+): Promise<void> => {
+  if (!(await isZipFile(source))) {
     fail('backupUnrecognized')
   }
   const imported = new Set<string>()
@@ -90,6 +97,22 @@ export const importArchive = async (file: File): Promise<void> => {
   let index: SessionIndexEntry[] | undefined
   let currentSessionId: string | undefined
 
+  // 图片攒批入库：逐条 put 在大归档下拖慢导入，攒批（约 32 条/事务）可提速数倍。
+  // 按条数和总字节数双阈值冲刷，避免大图撑爆内存。
+  const BATCH_COUNT = 32
+  const BATCH_BYTES = 32 * 1024 * 1024
+  let pendingFiles: { id: string; blob: Blob }[] = []
+  let pendingBytes = 0
+  const flushFiles = async () => {
+    if (!pendingFiles.length) {
+      return
+    }
+    const files = pendingFiles
+    pendingFiles = []
+    pendingBytes = 0
+    await db.saveStagingFiles(files)
+  }
+
   const saveImage = async (entry: ArchiveEntry, id: string) => {
     if (stored.has(id)) {
       await skipEntry(entry)
@@ -97,12 +120,17 @@ export const importArchive = async (file: File): Promise<void> => {
     }
     const data = await readEntry(entry)
     const type = imageType(new Uint8Array(await data.slice(0, 16).arrayBuffer()))
-    await db.saveStagingFiles([{ id, blob: new Blob([data], { type }) }])
+    const blob = new Blob([data], { type })
+    pendingFiles.push({ id, blob })
+    pendingBytes += blob.size
     stored.set(id, type)
+    if (pendingFiles.length >= BATCH_COUNT || pendingBytes >= BATCH_BYTES) {
+      await flushFiles()
+    }
   }
 
   try {
-    for await (const entry of readArchive(file)) {
+    for await (const entry of readArchive(source)) {
       const { path } = entry
       const sessionId = parseSessionPath(path)
       if (!manifest) {
@@ -138,6 +166,11 @@ export const importArchive = async (file: File): Promise<void> => {
       } else {
         fail('backupIncomplete')
       }
+      onProgress?.({
+        sessions: imported.size,
+        images: stored.size,
+        percent: Math.min(100, Math.round((entry.end / source.size) * 100)),
+      })
     }
   } catch (error) {
     throw error instanceof ArchiveError ? new BackupError('backupIncomplete') : error
@@ -145,6 +178,7 @@ export const importArchive = async (file: File): Promise<void> => {
   if (!manifest) {
     fail('backupUnrecognized')
   }
+  await flushFiles()
   // index 只列出成功写出的会话，与会话文件一一对应。
   const listed = new Set(index?.map((entry) => entry.id))
   if (

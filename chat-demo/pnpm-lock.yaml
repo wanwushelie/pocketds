@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@capacitor/core':
+        specifier: 8.6.2
+        version: 8.6.2
       '@types/katex':
         specifier: ^0.16.5
         version: 0.16.8
@@ -104,6 +107,9 @@ packages:
 
   '@braintree/sanitize-url@7.1.2':
     resolution: {integrity: sha512-jigsZK+sMF/cuiB7sERuo9V7N9jx+dhmHHnQyDSVdpZwVutaBu7WvNYqMDLSgFgfB30n452TP3vjDAvFC973mA==}
+
+  '@capacitor/core@8.6.2':
+    resolution: {integrity: sha512-UEb9crRuqEAe2Iu2eGOEuQ8rLQxpwg7ZZIpl17UJoytEpnV1e4oXXW0K7yYS2NsCOGmJjyLeKjNlgG7tkAoX8g==}
 
   '@chevrotain/cst-dts-gen@11.0.3':
     resolution: {integrity: sha512-BvIKpRLeS/8UbfxXxgC33xOumsacaeCKAjAeLyOn7Pcp95HiRbrpl14S+9vaZLolnbssPIUuiUd8IvgkRyt6NQ==}
@@ -1362,6 +1368,10 @@ snapshots:
   '@antfu/utils@8.1.1': {}
 
   '@braintree/sanitize-url@7.1.2': {}
+
+  '@capacitor/core@8.6.2':
+    dependencies:
+      tslib: 2.9.1
 
   '@chevrotain/cst-dts-gen@11.0.3':
     dependencies:

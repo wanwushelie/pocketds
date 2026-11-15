@@ -1,4 +1,13 @@
 import { Inflate } from 'fflate'
+import { readCachedRange, type CachedArchiveFile } from './nativeCache.js'
+
+/**
+ * 归档来源：网页端为用户选择的 File（可能挂在 content:// 管道上）；
+ * APK 内大文件走原生拷贝后的沙箱真实文件（CachedArchiveFile）。
+ */
+export type ZipSource = File | CachedArchiveFile
+
+const sizeOf = (source: ZipSource): number => source.size
 
 const READ_CHUNK_BYTES = 256 * 1024
 // 控制每轮同步解压的工作量；输出交给调用方保存后才继续读取。
@@ -17,12 +26,23 @@ const invalid = (): never => {
 }
 
 /** 本地文件头签名 PK\x03\x04，用于在解析前区分 ZIP 与其他文件。 */
-export const isZipFile = async (file: File) => {
-  const bytes = new Uint8Array(await file.slice(0, 4).arrayBuffer())
+export const isZipFile = async (source: ZipSource) => {
+  const bytes = await readBytes(source, 0, 4)
   return bytes.length === 4 && bytes.every((byte, index) => byte === [0x50, 0x4b, 3, 4][index])
 }
 
 const viewOf = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
+/** 整读缓存：同一 File 只读一次内存（导入流程内 File 生命周期短，WeakMap 足够） */
+const bufferOf = (file: File): Promise<ArrayBuffer> => {
+  let promise = bufferCache.get(file)
+  if (!promise) {
+    promise = file.arrayBuffer()
+    bufferCache.set(file, promise)
+  }
+  return promise
+}
+const bufferCache = new WeakMap<File, Promise<ArrayBuffer>>()
 
 const crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
   let crc = value
@@ -32,9 +52,28 @@ const crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
   return crc >>> 0
 })
 
-const readBytes = async (file: File, start: number, length: number) => {
-  if (start < 0 || length < 0 || start + length > file.size) {
+const readBytes = async (
+  source: ZipSource,
+  start: number,
+  length: number
+): Promise<Uint8Array<ArrayBuffer>> => {
+  if (start < 0 || length < 0 || start + length > sizeOf(source)) {
     invalid()
+  }
+  if ('kind' in source && source.kind === 'cache') {
+    // 沙箱真实文件：走原生 readRange，随机访问没有管道重读问题。
+    return await readCachedRange(source.path, start, length)
+  }
+  const file = source as File
+  // 随机访问在 Android WebView 的 content:// 管道文件上会退化为 O(n²) 重读；
+  // 不超过阈值时整读一次进内存，用零拷贝视图切片代替（zipReader 的访问全程只读）。
+  if (file.size <= 400 * 1024 * 1024) {
+    const buffer = await bufferOf(file)
+    const bytes = new Uint8Array(buffer, start, length)
+    if (bytes.length !== length) {
+      invalid()
+    }
+    return bytes
   }
   const bytes = new Uint8Array(await file.slice(start, start + length).arrayBuffer())
   if (bytes.length !== length) {
@@ -85,12 +124,12 @@ type Entry = {
   offset: number
 }
 
-const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: number }> => {
-  if (file.size < 22) {
+const readDirectory = async (source: ZipSource): Promise<{ entries: Entry[]; offset: number }> => {
+  if (sizeOf(source) < 22) {
     invalid()
   }
-  const tailStart = Math.max(0, file.size - 22 - 0xffff)
-  const tail = await readBytes(file, tailStart, file.size - tailStart)
+  const tailStart = Math.max(0, sizeOf(source) - 22 - 0xffff)
+  const tail = await readBytes(source, tailStart, sizeOf(source) - tailStart)
   const tailView = viewOf(tail)
   let end = tail.length - 22
   while (
@@ -124,7 +163,7 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
     if (cursor + 46 > size) {
       invalid()
     }
-    const view = viewOf(await readBytes(file, offset + cursor, 46))
+    const view = viewOf(await readBytes(source, offset + cursor, 46))
     if (view.getUint32(0, true) !== 0x02014b50) {
       invalid()
     }
@@ -150,7 +189,7 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
     ) {
       invalid()
     }
-    const name = await readBytes(file, offset + cursor + 46, nameLength)
+    const name = await readBytes(source, offset + cursor + 46, nameLength)
     const path = decodePath(name, flags)
     // 目录和同名文件也不能互相覆盖。
     const identity = path.endsWith('/') ? path.slice(0, -1) : path
@@ -158,7 +197,7 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
       invalid()
     }
     paths.add(identity)
-    checkExtra(await readBytes(file, offset + cursor + 46 + nameLength, extraLength))
+    checkExtra(await readBytes(source, offset + cursor + 46 + nameLength, extraLength))
     entries.push({
       path,
       name,
@@ -177,11 +216,11 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
   return { entries: entries.sort((a, b) => a.offset - b.offset), offset }
 }
 
-const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
+const readEntryOffset = async (source: ZipSource, entry: Entry, boundary: number) => {
   if (entry.offset + 30 > boundary) {
     invalid()
   }
-  const view = viewOf(await readBytes(file, entry.offset, 30))
+  const view = viewOf(await readBytes(source, entry.offset, 30))
   const nameLength = view.getUint16(26, true)
   const extraLength = view.getUint16(28, true)
   const start = entry.offset + 30 + nameLength + extraLength
@@ -205,7 +244,7 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
       invalid()
     }
   }
-  const metadata = await readBytes(file, entry.offset + 30, nameLength + extraLength)
+  const metadata = await readBytes(source, entry.offset + 30, nameLength + extraLength)
   if (entry.name.some((byte, index) => byte !== metadata[index])) {
     invalid()
   }
@@ -214,7 +253,7 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
     if (end + 12 > boundary) {
       invalid()
     }
-    const descriptor = viewOf(await readBytes(file, end, Math.min(16, boundary - end)))
+    const descriptor = viewOf(await readBytes(source, end, Math.min(16, boundary - end)))
     const shift = descriptor.getUint32(0, true) === 0x08074b50 ? 4 : 0
     if (
       shift + 12 > descriptor.byteLength ||
@@ -231,6 +270,9 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
 export type ArchiveEntry = {
   path: string
   size: number
+  /** 条目数据区在文件中的起始偏移与结束边界（下一数据区起点或中央目录起点），用于导入进度显示 */
+  offset: number
+  end: number
   stream: AsyncIterable<Uint8Array>
 }
 
@@ -238,11 +280,11 @@ export type ArchiveEntry = {
  * 按条目在文件中的物理顺序逐条、逐块解压，跳过目录条目。
  * 调用方必须消费完当前条目的数据，再请求下一个条目。
  */
-export async function* readArchive(file: File): AsyncGenerator<ArchiveEntry> {
-  const directory = await readDirectory(file)
+export async function* readArchive(source: ZipSource): AsyncGenerator<ArchiveEntry> {
+  const directory = await readDirectory(source)
   for (const [index, entry] of directory.entries.entries()) {
     const boundary = directory.entries[index + 1]?.offset ?? directory.offset
-    const start = await readEntryOffset(file, entry, boundary)
+    const start = await readEntryOffset(source, entry, boundary)
     if (entry.path.endsWith('/')) {
       continue
     }
@@ -264,34 +306,73 @@ export async function* readArchive(file: File): AsyncGenerator<ArchiveEntry> {
         }
       }
       const inflate = entry.method === 8 ? new Inflate(append) : null
-      for (let offset = 0; offset < entry.compressedSize; offset += READ_CHUNK_BYTES) {
-        const chunk = await readBytes(
-          file,
-          start + offset,
-          Math.min(READ_CHUNK_BYTES, entry.compressedSize - offset)
-        )
-        if (!inflate) {
-          append(chunk)
-          yield* pending.splice(0)
-          continue
+      const nativeInflate =
+        entry.method === 8 && typeof DecompressionStream === 'function'
+          ? new DecompressionStream('deflate-raw')
+          : null
+      if (nativeInflate) {
+        // 原生 inflate：并行喂入压缩数据，输出按需拉取；消费端异步写入期间解压自然暂停。
+        // 未拉取的输出最多缓冲到单条目大小（导入流程中最大为一张图片原件），可接受。
+        const reader = nativeInflate.readable.getReader()
+        const writer = nativeInflate.writable.getWriter()
+        const pumping = (async () => {
+          try {
+            for (let offset = 0; offset < entry.compressedSize; offset += READ_CHUNK_BYTES) {
+              const chunk = await readBytes(
+                source,
+                start + offset,
+                Math.min(READ_CHUNK_BYTES, entry.compressedSize - offset)
+              )
+              await writer.write(chunk)
+            }
+          } finally {
+            await writer.close().catch(() => {})
+          }
+        })()
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) {
+              break
+            }
+            append(value)
+            yield* pending.splice(0)
+          }
+          await pumping
+        } catch (error) {
+          void pumping.catch(() => {})
+          throw error
         }
-        for (let cursor = 0; cursor < chunk.length; cursor += INFLATE_CHUNK_BYTES) {
-          const end = Math.min(cursor + INFLATE_CHUNK_BYTES, chunk.length)
-          inflate.push(chunk.subarray(cursor, end), offset + end === entry.compressedSize)
-          // yield 暂停解压，等待调用方完成异步写入；不缓存整个条目。
+      } else {
+        for (let offset = 0; offset < entry.compressedSize; offset += READ_CHUNK_BYTES) {
+          const chunk = await readBytes(
+            source,
+            start + offset,
+            Math.min(READ_CHUNK_BYTES, entry.compressedSize - offset)
+          )
+          if (!inflate) {
+            append(chunk)
+            yield* pending.splice(0)
+            continue
+          }
+          for (let cursor = 0; cursor < chunk.length; cursor += INFLATE_CHUNK_BYTES) {
+            const end = Math.min(cursor + INFLATE_CHUNK_BYTES, chunk.length)
+            inflate.push(chunk.subarray(cursor, end), offset + end === entry.compressedSize)
+            // yield 暂停解压，等待调用方完成异步写入；不缓存整个条目。
+            yield* pending.splice(0)
+          }
+        }
+        if (inflate && entry.compressedSize === 0) {
+          inflate.push(new Uint8Array(), true)
           yield* pending.splice(0)
         }
-      }
-      if (inflate && entry.compressedSize === 0) {
-        inflate.push(new Uint8Array(), true)
-        yield* pending.splice(0)
       }
       if (written !== entry.size || (crc ^ 0xffffffff) >>> 0 !== entry.crc) {
         invalid()
       }
       completed = true
     }
-    yield { path: entry.path, size: entry.size, stream: stream() }
+    yield { path: entry.path, size: entry.size, offset: start, end: boundary, stream: stream() }
     if (!completed) {
       invalid()
     }

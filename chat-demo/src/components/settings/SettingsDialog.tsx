@@ -1,4 +1,5 @@
 import clsx from 'clsx'
+import { Capacitor } from '@capacitor/core'
 import { useRef, useState, type ReactNode } from 'react'
 import {
   IconDarkOutline16,
@@ -15,6 +16,9 @@ import {
   exportHistory,
   importHistory,
 } from '../../services/chat/backup.js'
+import type { ImportProgress } from '../../services/chat/history/importArchive.js'
+import { pickArchiveSource, releaseCachedArchive } from '../../services/chat/history/nativeCache.js'
+import type { ZipSource } from '../../services/chat/history/zipReader.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { useChatStore } from '../../services/chat/store.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
@@ -438,7 +442,7 @@ const SettingCell = ({
 
 /** 选文件后先提示覆盖；确认后才检查文件并执行导入，任何错误都提示导入失败。 */
 const useHistoryImport = () => {
-  const [file, setFile] = useState<File | null>(null)
+  const [file, setFile] = useState<ZipSource | null>(null)
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState<Status>(null)
   const importing = useRef(false)
@@ -450,13 +454,30 @@ const useHistoryImport = () => {
     importing.current = true
     setFile(null)
     setBusy(true)
-    setStatus(null)
+    setStatus({ key: 'historyImportRunning' })
     try {
-      const count = await importHistory(file)
+      let lastProgressAt = 0
+      const onProgress = (p: ImportProgress) => {
+        // 节流：进度条每 300ms 更新一次，避免大归档下频繁重渲染
+        const now = Date.now()
+        if (now - lastProgressAt < 300) {
+          return
+        }
+        lastProgressAt = now
+        setStatus({
+          key: 'historyImportProgress',
+          params: { count: p.sessions, images: p.images, percent: p.percent },
+        })
+      }
+      const count = await importHistory(file, onProgress)
       setStatus({ key: count === 1 ? 'historyImportedOne' : 'historyImported', params: { count } })
-    } catch {
-      setStatus({ key: 'historyImportFailed', error: true })
+    } catch (error) {
+      setStatus(errorStatus('historyImportFailed', error))
     } finally {
+      // APK 原生导入的沙箱缓存文件用完即删。
+      if ('kind' in file && file.kind === 'cache') {
+        void releaseCachedArchive(file)
+      }
       importing.current = false
       setBusy(false)
     }
@@ -476,6 +497,17 @@ const ImportHistory = ({
   const t = useTranslate()
   const inputRef = useRef<HTMLInputElement>(null)
 
+  // APK 内优先走原生文件选择 + 沙箱拷贝通道（大 ZIP 随机访问不再退化），
+  // 网页端或原生通道不可用时退回常规 <input type="file">。
+  const onPick = async () => {
+    const cached = await pickArchiveSource()
+    if (cached) {
+      historyImport.select(cached)
+    } else if (!Capacitor.isNativePlatform()) {
+      inputRef.current?.click()
+    }
+  }
+
   return (
     <SettingCell
       label={t('historyImport')}
@@ -488,7 +520,7 @@ const ImportHistory = ({
             size="m"
             className={clsx(styles.cellButton, styles.uploadButton)}
             disabled={disabled}
-            onClick={() => inputRef.current?.click()}
+            onClick={() => void onPick()}
           >
             <IconUploadOutline14 />
             {t('upload')}
