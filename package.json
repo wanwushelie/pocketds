@@ -1,0 +1,24 @@
+{
+  "name": "dsweb",
+  "version": "0.1.1",
+  "description": "DeepSeek chat-demo 的 Capacitor 多端壳（Android 已验证，iOS/鸿蒙规划中）",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build:web": "node tools/build-chat-demo.cjs",
+    "build:web:install": "node tools/build-chat-demo.cjs --install",
+    "sync": "cap sync android",
+    "apk:debug": "npm run build:web && npm run sync && cd android && ./gradlew assembleDebug",
+    "apk": "npm run build:web && npm run sync && cd android && ./gradlew assembleRelease",
+    "icon": "node tools/make_icon.cjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/cli": "^8.6.2",
+    "@capacitor/core": "^8.6.2"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "ws": "^8.23.0"
+  }
+}

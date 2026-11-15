@@ -1,0 +1,29 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# chat-demo 构建产物（npm run build:web 重新生成，cap sync 拷入 android）
+chat-demo/dist/
+
+# Capacitor 生成的 web 资源（npm run sync 重新生成）
+android/app/src/main/assets/public/
+
+# Android 构建产物
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/*.keystore
+android/key.properties
+
+# 签名与发布产物归档（含密钥，严禁入库）
+安装包/
+
+# 工具生成的预览图
+tools/icon-preview.png
+
+# IDE / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store

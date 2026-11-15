@@ -1,0 +1,192 @@
+diff --git a/src/components/settings/SettingsDialog.tsx b/src/components/settings/SettingsDialog.tsx
+index a74b591..ae6da06 100644
+--- a/src/components/settings/SettingsDialog.tsx
++++ b/src/components/settings/SettingsDialog.tsx
+@@ -15,6 +15,7 @@ import {
+   exportHistory,
+   importHistory,
+ } from '../../services/chat/backup.js'
++import type { ImportProgress } from '../../services/chat/history/importArchive.js'
+ import { useIsMobile } from '../../app/viewport.js'
+ import { useChatStore } from '../../services/chat/store.js'
+ import { regionCodes, getRegionName, provinces } from '../../services/location.js'
+@@ -450,12 +451,25 @@ const useHistoryImport = () => {
+     importing.current = true
+     setFile(null)
+     setBusy(true)
+-    setStatus(null)
++    setStatus({ key: 'historyImportRunning' })
+     try {
+-      const count = await importHistory(file)
++      let lastProgressAt = 0
++      const onProgress = (p: ImportProgress) => {
++        // 节流：进度条每 300ms 更新一次，避免大归档下频繁重渲染
++        const now = Date.now()
++        if (now - lastProgressAt < 300) {
++          return
++        }
++        lastProgressAt = now
++        setStatus({
++          key: 'historyImportProgress',
++          params: { count: p.sessions, images: p.images, percent: p.percent },
++        })
++      }
++      const count = await importHistory(file, onProgress)
+       setStatus({ key: count === 1 ? 'historyImportedOne' : 'historyImported', params: { count } })
+-    } catch {
+-      setStatus({ key: 'historyImportFailed', error: true })
++    } catch (error) {
++      setStatus(errorStatus('historyImportFailed', error))
+     } finally {
+       importing.current = false
+       setBusy(false)
+diff --git a/src/i18n/en.ts b/src/i18n/en.ts
+index 2d49027..230d19c 100644
+--- a/src/i18n/en.ts
++++ b/src/i18n/en.ts
+@@ -120,7 +120,10 @@ export const en = {
+   historyImportedOne: 'Imported 1 chat',
+   historyImported: 'Imported {count} chats',
+   historyImportFailed:
+-    'File import failed. The file format may be invalid, or the ZIP file may use an older chat export format. Please export your chat history from DeepSeek again and retry the import.',
++    'Import failed: {message}. Make sure the file is an uncorrupted ZIP exported from DeepSeek.',
++  historyImportRunning: 'Importing. Large files may take a few minutes. Keep this page open.',
++  historyImportProgress:
++    'Importing: {percent}% · {count} chats, {images} images parsed. Keep this page open.',
+   historyExportFailed: 'Export failed: {message}',
+   exportAllLabel: 'Export all chats',
+   historyExportDescription:
+diff --git a/src/i18n/zh.ts b/src/i18n/zh.ts
+index 5be09c0..b71437d 100644
+--- a/src/i18n/zh.ts
++++ b/src/i18n/zh.ts
+@@ -113,7 +113,10 @@ export const zh = {
+   historyImportedOne: '已导入 1 个对话',
+   historyImported: '已导入 {count} 个对话',
+   historyImportFailed:
+-    '文件导入失败，可能是文件格式错误或使用了旧版的对话导出 ZIP 文件，请前往 DeepSeek 重新导出历史对话文件后再次导入。',
++    '导入失败：{message}。请确认文件为 DeepSeek 官网导出的 ZIP 且未损坏。',
++  historyImportRunning: '正在导入，大文件可能需要数分钟，请勿关闭此页或锁屏。',
++  historyImportProgress:
++    '正在导入：{percent}% · 已解析 {count} 个会话、{images} 张图片，请勿关闭此页或锁屏。',
+   historyExportFailed: '导出失败：{message}',
+   exportAllLabel: '导出所有历史对话',
+   historyExportDescription:
+diff --git a/src/services/chat/backup.ts b/src/services/chat/backup.ts
+index 73e42f6..6206de9 100644
+--- a/src/services/chat/backup.ts
++++ b/src/services/chat/backup.ts
+@@ -2,6 +2,7 @@ import { formatDate } from '../../utils/format.js'
+ import * as db from './db.js'
+ import { replaceHistory, useChatStore } from './store.js'
+ import type { Session } from './types.js'
++import type { ImportProgress } from './history/importArchive.js'
+
+ export { BackupError } from './history/errors.js'
+
+@@ -43,11 +44,14 @@ export const exportHistory = (): Promise<{ name: string; blob: Blob }> =>
+  * 确认覆盖后调用：先检查 ZIP 格式与版本，校验失败时保留正在生成的回答；
+  * 通过后从 ZIP 流式写入暂存，成功才替换原有会话与图片原件。返回导入的会话数。
+  */
+-export const importHistory = (file: File): Promise<number> =>
++export const importHistory = (
++  file: File,
++  onProgress?: (progress: ImportProgress) => void
++): Promise<number> =>
+   enqueueBackup(async () => {
+     const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
+     await checkArchiveFormat(file)
+-    return replaceHistory(() => importArchive(file))
++    return replaceHistory(() => importArchive(file, onProgress))
+   })
+
+ /** 确认删除后调用：以空历史原子替换全部本地会话与附件，保留 API Key 和其他设置。 */
+diff --git a/src/services/chat/history/importArchive.ts b/src/services/chat/history/importArchive.ts
+index 6ecf239..6544f8e 100644
+--- a/src/services/chat/history/importArchive.ts
++++ b/src/services/chat/history/importArchive.ts
+@@ -78,7 +78,13 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
+  * 会话读完立即暂存，只保留图片路径映射；图片全部读完后逐会话回填 MIME，不改变图片身份。
+  * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
+  */
+-export const importArchive = async (file: File): Promise<void> => {
++/** 导入进度：已解析会话数、已保存图片数、按字节估算的百分比 */
++export type ImportProgress = { sessions: number; images: number; percent: number }
++
++export const importArchive = async (
++  file: File,
++  onProgress?: (progress: ImportProgress) => void
++): Promise<void> => {
+   if (!(await isZipFile(file))) {
+     fail('backupUnrecognized')
+   }
+@@ -138,6 +144,11 @@ export const importArchive = async (file: File): Promise<void> => {
+       } else {
+         fail('backupIncomplete')
+       }
++      onProgress?.({
++        sessions: imported.size,
++        images: stored.size,
++        percent: Math.min(100, Math.round((entry.end / file.size) * 100)),
++      })
+     }
+   } catch (error) {
+     throw error instanceof ArchiveError ? new BackupError('backupIncomplete') : error
+diff --git a/src/services/chat/history/zipReader.ts b/src/services/chat/history/zipReader.ts
+index ed43ef1..d3a1356 100644
+--- a/src/services/chat/history/zipReader.ts
++++ b/src/services/chat/history/zipReader.ts
+@@ -24,6 +24,17 @@ export const isZipFile = async (file: File) => {
+
+ const viewOf = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
++/** 整读缓存：同一 File 只读一次内存（导入流程内 File 生命周期短，WeakMap 足够） */
++const bufferOf = (file: File): Promise<ArrayBuffer> => {
++  let promise = bufferCache.get(file)
++  if (!promise) {
++    promise = file.arrayBuffer()
++    bufferCache.set(file, promise)
++  }
++  return promise
++}
++const bufferCache = new WeakMap<File, Promise<ArrayBuffer>>()
++
+ const crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
+   let crc = value
+   for (let bit = 0; bit < 8; bit++) {
+@@ -36,6 +47,16 @@ const readBytes = async (file: File, start: number, length: number) => {
+   if (start < 0 || length < 0 || start + length > file.size) {
+     invalid()
+   }
++  // 随机访问在 Android WebView 的 content:// 管道文件上会退化为 O(n²) 重读；
++  // 不超过阈值时整读一次进内存，用零拷贝视图切片代替（zipReader 的访问全程只读）。
++  if (file.size <= 400 * 1024 * 1024) {
++    const buffer = await bufferOf(file)
++    const bytes = new Uint8Array(buffer, start, length)
++    if (bytes.length !== length) {
++      invalid()
++    }
++    return bytes
++  }
+   const bytes = new Uint8Array(await file.slice(start, start + length).arrayBuffer())
+   if (bytes.length !== length) {
+     invalid()
+@@ -231,6 +252,9 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
+ export type ArchiveEntry = {
+   path: string
+   size: number
++  /** 条目数据区在文件中的起始偏移与结束边界（下一数据区起点或中央目录起点），用于导入进度显示 */
++  offset: number
++  end: number
+   stream: AsyncIterable<Uint8Array>
+ }
+
+@@ -291,7 +315,7 @@ export async function* readArchive(file: File): AsyncGenerator<ArchiveEntry> {
+       }
+       completed = true
+     }
+-    yield { path: entry.path, size: entry.size, stream: stream() }
++    yield { path: entry.path, size: entry.size, offset: start, end: boundary, stream: stream() }
+     if (!completed) {
+       invalid()
+     }

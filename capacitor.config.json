@@ -1,0 +1,5 @@
+{
+  "appId": "com.dsweb.chat",
+  "appName": "DS Chat",
+  "webDir": "chat-demo/dist"
+}

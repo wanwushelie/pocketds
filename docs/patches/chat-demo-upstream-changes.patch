@@ -1,0 +1,915 @@
+diff --git a/package.json b/package.json
+index a270b7d..6356a49 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,7 @@
+     "format": "oxfmt --write ."
+   },
+   "dependencies": {
++    "@capacitor/core": "8.6.2",
+     "@types/katex": "^0.16.5",
+     "@types/mdast": "~4.0.3",
+     "@types/prismjs": "^1.26.1",
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index c2a83a0..b78e39b 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -8,6 +8,9 @@ importers:
+ 
+   .:
+     dependencies:
++      '@capacitor/core':
++        specifier: 8.6.2
++        version: 8.6.2
+       '@types/katex':
+         specifier: ^0.16.5
+         version: 0.16.8
+@@ -105,6 +108,9 @@ packages:
+   '@braintree/sanitize-url@7.1.2':
+     resolution: {integrity: sha512-jigsZK+sMF/cuiB7sERuo9V7N9jx+dhmHHnQyDSVdpZwVutaBu7WvNYqMDLSgFgfB30n452TP3vjDAvFC973mA==}
+ 
++  '@capacitor/core@8.6.2':
++    resolution: {integrity: sha512-UEb9crRuqEAe2Iu2eGOEuQ8rLQxpwg7ZZIpl17UJoytEpnV1e4oXXW0K7yYS2NsCOGmJjyLeKjNlgG7tkAoX8g==}
++
+   '@chevrotain/cst-dts-gen@11.0.3':
+     resolution: {integrity: sha512-BvIKpRLeS/8UbfxXxgC33xOumsacaeCKAjAeLyOn7Pcp95HiRbrpl14S+9vaZLolnbssPIUuiUd8IvgkRyt6NQ==}
+ 
+@@ -1363,6 +1369,10 @@ snapshots:
+ 
+   '@braintree/sanitize-url@7.1.2': {}
+ 
++  '@capacitor/core@8.6.2':
++    dependencies:
++      tslib: 2.9.1
++
+   '@chevrotain/cst-dts-gen@11.0.3':
+     dependencies:
+       '@chevrotain/gast': 11.0.3
+diff --git a/src/components/settings/SettingsDialog.tsx b/src/components/settings/SettingsDialog.tsx
+index a74b591..d52a46d 100644
+--- a/src/components/settings/SettingsDialog.tsx
++++ b/src/components/settings/SettingsDialog.tsx
+@@ -1,4 +1,5 @@
+ import clsx from 'clsx'
++import { Capacitor } from '@capacitor/core'
+ import { useRef, useState, type ReactNode } from 'react'
+ import {
+   IconDarkOutline16,
+@@ -15,6 +16,9 @@ import {
+   exportHistory,
+   importHistory,
+ } from '../../services/chat/backup.js'
++import type { ImportProgress } from '../../services/chat/history/importArchive.js'
++import { pickArchiveSource, releaseCachedArchive } from '../../services/chat/history/nativeCache.js'
++import type { ZipSource } from '../../services/chat/history/zipReader.js'
+ import { useIsMobile } from '../../app/viewport.js'
+ import { useChatStore } from '../../services/chat/store.js'
+ import { regionCodes, getRegionName, provinces } from '../../services/location.js'
+@@ -438,7 +442,7 @@ const SettingCell = ({
+ 
+ /** 选文件后先提示覆盖；确认后才检查文件并执行导入，任何错误都提示导入失败。 */
+ const useHistoryImport = () => {
+-  const [file, setFile] = useState<File | null>(null)
++  const [file, setFile] = useState<ZipSource | null>(null)
+   const [busy, setBusy] = useState(false)
+   const [status, setStatus] = useState<Status>(null)
+   const importing = useRef(false)
+@@ -450,13 +454,30 @@ const useHistoryImport = () => {
+     importing.current = true
+     setFile(null)
+     setBusy(true)
+-    setStatus(null)
++    setStatus({ key: 'historyImportRunning' })
+     try {
+-      const count = await importHistory(file)
++      let lastProgressAt = 0
++      const onProgress = (p: ImportProgress) => {
++        // 节流：进度条每 300ms 更新一次，避免大归档下频繁重渲染
++        const now = Date.now()
++        if (now - lastProgressAt < 300) {
++          return
++        }
++        lastProgressAt = now
++        setStatus({
++          key: 'historyImportProgress',
++          params: { count: p.sessions, images: p.images, percent: p.percent },
++        })
++      }
++      const count = await importHistory(file, onProgress)
+       setStatus({ key: count === 1 ? 'historyImportedOne' : 'historyImported', params: { count } })
+-    } catch {
+-      setStatus({ key: 'historyImportFailed', error: true })
++    } catch (error) {
++      setStatus(errorStatus('historyImportFailed', error))
+     } finally {
++      // APK 原生导入的沙箱缓存文件用完即删。
++      if ('kind' in file && file.kind === 'cache') {
++        void releaseCachedArchive(file)
++      }
+       importing.current = false
+       setBusy(false)
+     }
+@@ -476,6 +497,17 @@ const ImportHistory = ({
+   const t = useTranslate()
+   const inputRef = useRef<HTMLInputElement>(null)
+ 
++  // APK 内优先走原生文件选择 + 沙箱拷贝通道（大 ZIP 随机访问不再退化），
++  // 网页端或原生通道不可用时退回常规 <input type="file">。
++  const onPick = async () => {
++    const cached = await pickArchiveSource()
++    if (cached) {
++      historyImport.select(cached)
++    } else if (!Capacitor.isNativePlatform()) {
++      inputRef.current?.click()
++    }
++  }
++
+   return (
+     <SettingCell
+       label={t('historyImport')}
+@@ -488,7 +520,7 @@ const ImportHistory = ({
+             size="m"
+             className={clsx(styles.cellButton, styles.uploadButton)}
+             disabled={disabled}
+-            onClick={() => inputRef.current?.click()}
++            onClick={() => void onPick()}
+           >
+             <IconUploadOutline14 />
+             {t('upload')}
+diff --git a/src/i18n/en.ts b/src/i18n/en.ts
+index 2d49027..230d19c 100644
+--- a/src/i18n/en.ts
++++ b/src/i18n/en.ts
+@@ -120,7 +120,10 @@ export const en = {
+   historyImportedOne: 'Imported 1 chat',
+   historyImported: 'Imported {count} chats',
+   historyImportFailed:
+-    'File import failed. The file format may be invalid, or the ZIP file may use an older chat export format. Please export your chat history from DeepSeek again and retry the import.',
++    'Import failed: {message}. Make sure the file is an uncorrupted ZIP exported from DeepSeek.',
++  historyImportRunning: 'Importing. Large files may take a few minutes. Keep this page open.',
++  historyImportProgress:
++    'Importing: {percent}% · {count} chats, {images} images parsed. Keep this page open.',
+   historyExportFailed: 'Export failed: {message}',
+   exportAllLabel: 'Export all chats',
+   historyExportDescription:
+diff --git a/src/i18n/zh.ts b/src/i18n/zh.ts
+index d99f058..3d2c3a9 100644
+--- a/src/i18n/zh.ts
++++ b/src/i18n/zh.ts
+@@ -113,7 +113,10 @@ export const zh = {
+   historyImportedOne: '已导入 1 个对话',
+   historyImported: '已导入 {count} 个对话',
+   historyImportFailed:
+-    '文件导入失败，可能是文件格式错误或使用了旧版的对话导出 ZIP 文件，请前往 DeepSeek 重新导出历史对话文件后再次导入。',
++    '导入失败：{message}。请确认文件为 DeepSeek 官网导出的 ZIP 且未损坏。',
++  historyImportRunning: '正在导入，大文件可能需要数分钟，请勿关闭此页或锁屏。',
++  historyImportProgress:
++    '正在导入：{percent}% · 已解析 {count} 个会话、{images} 张图片，请勿关闭此页或锁屏。',
+   historyExportFailed: '导出失败：{message}',
+   exportAllLabel: '导出所有历史对话',
+   historyExportDescription:
+diff --git a/src/services/chat/backup.ts b/src/services/chat/backup.ts
+index 73e42f6..be8b6f9 100644
+--- a/src/services/chat/backup.ts
++++ b/src/services/chat/backup.ts
+@@ -2,6 +2,8 @@ import { formatDate } from '../../utils/format.js'
+ import * as db from './db.js'
+ import { replaceHistory, useChatStore } from './store.js'
+ import type { Session } from './types.js'
++import type { ImportProgress } from './history/importArchive.js'
++import type { ZipSource } from './history/zipReader.js'
+ 
+ export { BackupError } from './history/errors.js'
+ 
+@@ -43,11 +45,14 @@ export const exportHistory = (): Promise<{ name: string; blob: Blob }> =>
+  * 确认覆盖后调用：先检查 ZIP 格式与版本，校验失败时保留正在生成的回答；
+  * 通过后从 ZIP 流式写入暂存，成功才替换原有会话与图片原件。返回导入的会话数。
+  */
+-export const importHistory = (file: File): Promise<number> =>
++export const importHistory = (
++  source: ZipSource,
++  onProgress?: (progress: ImportProgress) => void
++): Promise<number> =>
+   enqueueBackup(async () => {
+     const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
+-    await checkArchiveFormat(file)
+-    return replaceHistory(() => importArchive(file))
++    await checkArchiveFormat(source)
++    return replaceHistory(() => importArchive(source, onProgress))
+   })
+ 
+ /** 确认删除后调用：以空历史原子替换全部本地会话与附件，保留 API Key 和其他设置。 */
+diff --git a/src/services/chat/db.ts b/src/services/chat/db.ts
+index a1f58ea..48f2dd7 100644
+--- a/src/services/chat/db.ts
++++ b/src/services/chat/db.ts
+@@ -10,12 +10,17 @@ export type StoredFile = {
+   blob: Blob
+ }
+ 
++/** 会话正文以 gzip JSON Blob 存储，明显降低 IndexedDB 占用（文字部分约省 4-6 倍）。 */
++type StoredSession = { id: string; data: Blob }
++/** 旧版本直接存 Session 对象；读取时按形状区分，重新写入时统一转为压缩格式，无需迁移事务。 */
++type SessionRecord = StoredSession | Session
++
+ /** 文件引用留在摘要中，删除会话时通过索引判断原件是否仍被引用。 */
+ type StoredSessionSummary = SessionSummary & { fileIds: string[] }
+ 
+ interface ChatDB extends DBSchema {
+   /** 当前使用的会话，界面读写都在这里 */
+-  sessions: { key: string; value: Session }
++  sessions: { key: string; value: SessionRecord }
+   sessionSummaries: {
+     key: string
+     value: StoredSessionSummary
+@@ -27,7 +32,7 @@ interface ChatDB extends DBSchema {
+    * 历史导入的暂存：导入过程中会话与原件只写入这两个存储，`sessions` / `files` 保持不变；
+    * 全部校验通过后在一个事务中替换正式数据并清空暂存，失败时只清空暂存。
+    */
+-  sessionsStaging: { key: string; value: Session }
++  sessionsStaging: { key: string; value: SessionRecord }
+   filesStaging: { key: string; value: StoredFile }
+ }
+ 
+@@ -52,6 +57,28 @@ const abortTransaction = (tx: { abort(): void }) => {
+   }
+ }
+ 
++const gzipText = (text: string): Promise<Blob> =>
++  new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))).blob()
++
++const gunzipText = (blob: Blob): Promise<string> =>
++  new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).text()
++
++/** 写入统一转压缩格式；不支持的极旧环境退回原有对象存储（读取按形状兼容）。 */
++const encodeSession = async (session: Session): Promise<SessionRecord> => {
++  if (typeof CompressionStream !== 'function') {
++    return session
++  }
++  return { id: session.id, data: await gzipText(JSON.stringify(session)) }
++}
++
++const decodeSessionRecord = async (record: SessionRecord): Promise<Session> => {
++  const stored = record as StoredSession
++  if (stored.data instanceof Blob) {
++    return JSON.parse(await gunzipText(stored.data)) as Session
++  }
++  return record as Session
++}
++
+ // 每个操作拿到连接后立即创建事务；IndexedDB 按创建顺序执行范围重叠的事务，读取总能看到之前发起的写入。
+ const getDB = () =>
+   (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
+@@ -78,11 +105,15 @@ const getDB = () =>
+ export const loadSessionSummaries = async (): Promise<SessionSummary[]> =>
+   (await (await getDB()).getAll('sessionSummaries')).map(toSessionSummary)
+ 
+-export const loadSession = async (id: string): Promise<Session | undefined> =>
+-  (await getDB()).get('sessions', id)
++export const loadSession = async (id: string): Promise<Session | undefined> => {
++  const record = await (await getDB()).get('sessions', id)
++  return record ? decodeSessionRecord(record) : undefined
++}
+ 
+ export const saveSession = async (session: Session, files: StoredFile[] = []): Promise<void> => {
+   const summary = storedSummary(session)
++  // 流式解压/编码不能发生在 IndexedDB 事务内：await 非 IDB 操作会让事务提前提交
++  const record = await encodeSession(session)
+   const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
+   await Promise.all([
+     (async () => {
+@@ -90,7 +121,7 @@ export const saveSession = async (session: Session, files: StoredFile[] = []): P
+         for (const file of files) {
+           await tx.objectStore('files').put(file)
+         }
+-        await tx.objectStore('sessions').put(session)
++        await tx.objectStore('sessions').put(record)
+         await tx.objectStore('sessionSummaries').put(summary)
+       } catch (error) {
+         abortTransaction(tx)
+@@ -103,17 +134,20 @@ export const saveSession = async (session: Session, files: StoredFile[] = []): P
+ 
+ /** 未打开的会话也可重命名，只读取该会话，原子更新详情和列表。 */
+ export const renameSession = async (id: string, title: string): Promise<void> => {
++  const record = await (await getDB()).get('sessions', id)
++  if (!record) {
++    return
++  }
++  const decoded = await decodeSessionRecord(record)
++  decoded.title = title
++  const summary = storedSummary(decoded)
++  const nextRecord = await encodeSession(decoded)
+   const tx = (await getDB()).transaction(['sessions', 'sessionSummaries'], 'readwrite')
+   await Promise.all([
+     (async () => {
+       try {
+-        const sessions = tx.objectStore('sessions')
+-        const session = await sessions.get(id)
+-        if (session) {
+-          session.title = title
+-          await sessions.put(session)
+-          await tx.objectStore('sessionSummaries').put(storedSummary(session))
+-        }
++        await tx.objectStore('sessions').put(nextRecord)
++        await tx.objectStore('sessionSummaries').put(summary)
+       } catch (error) {
+         abortTransaction(tx)
+         throw error
+@@ -168,7 +202,7 @@ export const clearStaging = async (): Promise<void> => {
+ }
+ 
+ export const addStagingSession = async (session: Session): Promise<void> => {
+-  await (await getDB()).add('sessionsStaging', session)
++  await (await getDB()).add('sessionsStaging', await encodeSession(session))
+ }
+ 
+ export const saveStagingFiles = (files: StoredFile[]): Promise<void> =>
+@@ -176,70 +210,74 @@ export const saveStagingFiles = (files: StoredFile[]): Promise<void> =>
+ 
+ /** 图片位于会话 JSON 之后；全部读完后回填具体 MIME，保留归档给出的 isImage 标识。 */
+ export const updateStagingFileTypes = async (types: ReadonlyMap<string, string>): Promise<void> => {
+-  const tx = (await getDB()).transaction('sessionsStaging', 'readwrite')
+-  await Promise.all([
+-    (async () => {
+-      for (let cursor = await tx.store.openCursor(); cursor; cursor = await cursor.continue()) {
+-        const session = cursor.value
+-        let changed = false
+-        for (const message of session.messages) {
+-          if (message.role !== 'user') {
+-            continue
+-          }
+-          for (const file of message.files) {
+-            const type = types.get(file.id) ?? ''
+-            if (file.mimeType !== type) {
+-              file.mimeType = type
+-              changed = true
+-            }
+-          }
+-        }
+-        if (changed) {
+-          await cursor.update(session)
++  const db = await getDB()
++  // 解码/编码是流式异步操作，必须避开 IndexedDB 事务（事务内 await 非 IDB 操作会提前提交），
++  // 逐条读取后用独立事务写回。
++  const records = await db.getAll('sessionsStaging')
++  for (const record of records) {
++    const session = await decodeSessionRecord(record)
++    let changed = false
++    for (const message of session.messages) {
++      if (message.role !== 'user') {
++        continue
++      }
++      for (const file of message.files) {
++        const type = types.get(file.id) ?? ''
++        if (file.mimeType !== type) {
++          file.mimeType = type
++          changed = true
+         }
+       }
+-    })(),
+-    tx.done,
+-  ])
++    }
++    if (changed) {
++      await db.put('sessionsStaging', await encodeSession(session))
++    }
++  }
+ }
+ 
+ /**
+  * 导入完成后用暂存替换正式数据：同一事务中替换会话、摘要和原件，并清空暂存。
+- * 逐条游标复制，同一时间只读取一条记录；事务失败时整体回滚，正式数据不变。
++ * 先在事务外读出暂存并完成解压/摘要计算，再在单一事务中同步替换：
++ * 事务内只允许 IndexedDB 请求，await 流式解压等操作会让事务提前提交。
++ * 写入阶段失败时整体回滚，正式数据不变。
+  */
+ export const commitStaging = async (): Promise<SessionSummary[]> => {
++  const db = await getDB()
++  const sessionRecords = await db.getAll('sessionsStaging')
++  const fileRecords = await db.getAll('filesStaging')
+   const summaries: SessionSummary[] = []
+-  const tx = (await getDB()).transaction(
++  const sessionSummaries: StoredSessionSummary[] = []
++  for (const record of sessionRecords) {
++    const summary = storedSummary(await decodeSessionRecord(record))
++    sessionSummaries.push(summary)
++    summaries.push(toSessionSummary(summary))
++  }
++
++  const tx = db.transaction(
+     ['sessions', 'sessionSummaries', 'files', 'sessionsStaging', 'filesStaging'],
+     'readwrite'
+   )
+-  const move = async (from: 'sessionsStaging' | 'filesStaging', to: 'sessions' | 'files') => {
+-    try {
+-      const target = tx.objectStore(to)
+-      await target.clear()
+-      if (to === 'sessions') {
+-        await tx.objectStore('sessionSummaries').clear()
+-      }
+-      for (
+-        let cursor = await tx.objectStore(from).openCursor();
+-        cursor;
+-        cursor = await cursor.continue()
+-      ) {
+-        await target.put(cursor.value)
+-        if (to === 'sessions') {
+-          const summary = storedSummary(cursor.value as Session)
+-          await tx.objectStore('sessionSummaries').put(summary)
+-          summaries.push(toSessionSummary(summary))
+-        }
+-      }
+-      await tx.objectStore(from).clear()
+-    } catch (error) {
+-      // 同步抛出的错误不会让事务自动回滚，需显式中止，避免只提交清空和部分移入。
+-      abortTransaction(tx)
+-      throw error
++  try {
++    await tx.objectStore('sessions').clear()
++    await tx.objectStore('sessionSummaries').clear()
++    await tx.objectStore('files').clear()
++    for (const record of sessionRecords) {
++      await tx.objectStore('sessions').put(record)
++    }
++    for (const summary of sessionSummaries) {
++      await tx.objectStore('sessionSummaries').put(summary)
+     }
++    for (const record of fileRecords) {
++      await tx.objectStore('files').put(record)
++    }
++    await tx.objectStore('sessionsStaging').clear()
++    await tx.objectStore('filesStaging').clear()
++  } catch (error) {
++    // 同步抛出的错误不会让事务自动回滚，需显式中止，避免只提交清空和部分移入。
++    abortTransaction(tx)
++    throw error
+   }
+-  await Promise.all([move('sessionsStaging', 'sessions'), move('filesStaging', 'files'), tx.done])
++  await tx.done
+   // 直接返回本次提交的列表，调用方无需在替换成功后再发起可能失败的读取。
+   return summaries
+ }
+diff --git a/src/services/chat/history/importArchive.ts b/src/services/chat/history/importArchive.ts
+index 6ecf239..210b4d3 100644
+--- a/src/services/chat/history/importArchive.ts
++++ b/src/services/chat/history/importArchive.ts
+@@ -11,6 +11,7 @@ import {
+   readEntry,
+   skipEntry,
+   type ArchiveEntry,
++  type ZipSource,
+ } from './zipReader.js'
+ 
+ /** 从原件字节补充图片 MIME；无法识别时为空字符串，图片身份仍由归档的 is_image 决定。 */
+@@ -54,12 +55,12 @@ const readJson = async (entry: ArchiveEntry): Promise<unknown> => {
+  * 检查 ZIP 格式、首个 manifest 条目及格式版本。
+  * 校验失败时保留正在生成的回答和现有暂存数据。
+  */
+-export const checkArchiveFormat = async (file: File): Promise<void> => {
+-  if (!(await isZipFile(file))) {
++export const checkArchiveFormat = async (source: ZipSource): Promise<void> => {
++  if (!(await isZipFile(source))) {
+     fail('backupUnrecognized')
+   }
+   try {
+-    for await (const entry of readArchive(file)) {
++    for await (const entry of readArchive(source)) {
+       if (entry.path !== MANIFEST_PATH) {
+         fail('backupUnrecognized')
+       }
+@@ -78,8 +79,14 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
+  * 会话读完立即暂存，只保留图片路径映射；图片全部读完后逐会话回填 MIME，不改变图片身份。
+  * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
+  */
+-export const importArchive = async (file: File): Promise<void> => {
+-  if (!(await isZipFile(file))) {
++/** 导入进度：已解析会话数、已保存图片数、按字节估算的百分比 */
++export type ImportProgress = { sessions: number; images: number; percent: number }
++
++export const importArchive = async (
++  source: ZipSource,
++  onProgress?: (progress: ImportProgress) => void
++): Promise<void> => {
++  if (!(await isZipFile(source))) {
+     fail('backupUnrecognized')
+   }
+   const imported = new Set<string>()
+@@ -90,6 +97,22 @@ export const importArchive = async (file: File): Promise<void> => {
+   let index: SessionIndexEntry[] | undefined
+   let currentSessionId: string | undefined
+ 
++  // 图片攒批入库：逐条 put 在大归档下拖慢导入，攒批（约 32 条/事务）可提速数倍。
++  // 按条数和总字节数双阈值冲刷，避免大图撑爆内存。
++  const BATCH_COUNT = 32
++  const BATCH_BYTES = 32 * 1024 * 1024
++  let pendingFiles: { id: string; blob: Blob }[] = []
++  let pendingBytes = 0
++  const flushFiles = async () => {
++    if (!pendingFiles.length) {
++      return
++    }
++    const files = pendingFiles
++    pendingFiles = []
++    pendingBytes = 0
++    await db.saveStagingFiles(files)
++  }
++
+   const saveImage = async (entry: ArchiveEntry, id: string) => {
+     if (stored.has(id)) {
+       await skipEntry(entry)
+@@ -97,12 +120,17 @@ export const importArchive = async (file: File): Promise<void> => {
+     }
+     const data = await readEntry(entry)
+     const type = imageType(new Uint8Array(await data.slice(0, 16).arrayBuffer()))
+-    await db.saveStagingFiles([{ id, blob: new Blob([data], { type }) }])
++    const blob = new Blob([data], { type })
++    pendingFiles.push({ id, blob })
++    pendingBytes += blob.size
+     stored.set(id, type)
++    if (pendingFiles.length >= BATCH_COUNT || pendingBytes >= BATCH_BYTES) {
++      await flushFiles()
++    }
+   }
+ 
+   try {
+-    for await (const entry of readArchive(file)) {
++    for await (const entry of readArchive(source)) {
+       const { path } = entry
+       const sessionId = parseSessionPath(path)
+       if (!manifest) {
+@@ -138,6 +166,11 @@ export const importArchive = async (file: File): Promise<void> => {
+       } else {
+         fail('backupIncomplete')
+       }
++      onProgress?.({
++        sessions: imported.size,
++        images: stored.size,
++        percent: Math.min(100, Math.round((entry.end / source.size) * 100)),
++      })
+     }
+   } catch (error) {
+     throw error instanceof ArchiveError ? new BackupError('backupIncomplete') : error
+@@ -145,6 +178,7 @@ export const importArchive = async (file: File): Promise<void> => {
+   if (!manifest) {
+     fail('backupUnrecognized')
+   }
++  await flushFiles()
+   // index 只列出成功写出的会话，与会话文件一一对应。
+   const listed = new Set(index?.map((entry) => entry.id))
+   if (
+diff --git a/src/services/chat/history/nativeCache.ts b/src/services/chat/history/nativeCache.ts
+new file mode 100644
+index 0000000..7bdae5a
+--- /dev/null
++++ b/src/services/chat/history/nativeCache.ts
+@@ -0,0 +1,79 @@
++import { Capacitor, registerPlugin } from '@capacitor/core'
++
++/**
++ * APK 内大文件导入的原生通道（优化 #1）：
++ * WebView 文件选择器交给网页的是 content:// 管道文件，随机访问会 O(n²) 重读；
++ * 这里改由原生层用系统文件选择器拿 content:// URI，整段拷进应用沙箱变成真实文件，
++ * 之后 zipReader 对它的随机访问走 readRange 桥接，速度接近磁盘上限。
++ * 网页端（非 APK）插件不存在，调用方退回原有 <input type="file"> 路径。
++ */
++export type CachedArchiveFile = {
++  kind: 'cache'
++  /** 沙箱内真实文件的绝对路径 */
++  path: string
++  name: string
++  size: number
++}
++
++type PickedArchive = { path: string; name: string; size: number }
++
++type ImportFileCachePlugin = {
++  pickAndCache(): Promise<PickedArchive | undefined>
++  readRange(options: { path: string; offset: number; length: number }): Promise<{ data: string }>
++  release(options: { path: string }): Promise<void>
++}
++
++const ImportFileCache = registerPlugin<ImportFileCachePlugin>('ImportFileCache')
++
++const base64Bytes = (data: string): Uint8Array<ArrayBuffer> => {
++  const binary = atob(data)
++  const bytes = new Uint8Array(binary.length)
++  for (let index = 0; index < binary.length; index++) {
++    bytes[index] = binary.charCodeAt(index)
++  }
++  return bytes
++}
++
++/** 原生文件随机读：返回不超过 length 的字节，越界即抛错（与 zipReader 的 invalid 语义对齐）。 */
++export const readCachedRange = async (
++  path: string,
++  start: number,
++  length: number
++): Promise<Uint8Array<ArrayBuffer>> => {
++  // 零长度读（如无扩展字段的 ZIP 条目）不需要过桥
++  if (length === 0) {
++    return new Uint8Array(0)
++  }
++  const { data } = await ImportFileCache.readRange({ path, offset: start, length })
++  const bytes = base64Bytes(data)
++  if (bytes.length !== length) {
++    throw new RangeError(`cached range ${start}+${length} read ${bytes.length} bytes`)
++  }
++  return bytes
++}
++
++/** 释放沙箱缓存文件；导入结束（无论成败）都应调用。 */
++export const releaseCachedArchive = async (file: CachedArchiveFile): Promise<void> => {
++  try {
++    await ImportFileCache.release({ path: file.path })
++  } catch (error) {
++    console.warn('[import] release cached archive failed', error)
++  }
++}
++
++/**
++ * 打开系统文件选择器并把选中 ZIP 拷入沙箱。
++ * 返回 undefined 表示不可用（网页端）或用户取消；插件异常同样回退 undefined，调用方走旧路径。
++ */
++export const pickArchiveSource = async (): Promise<CachedArchiveFile | undefined> => {
++  if (!Capacitor.isNativePlatform()) {
++    return undefined
++  }
++  try {
++    const picked = await ImportFileCache.pickAndCache()
++    return picked ? { kind: 'cache', ...picked } : undefined
++  } catch (error) {
++    console.warn('[import] native pick failed, fallback to file input', error)
++    return undefined
++  }
++}
+diff --git a/src/services/chat/history/zipReader.ts b/src/services/chat/history/zipReader.ts
+index ed43ef1..7caf469 100644
+--- a/src/services/chat/history/zipReader.ts
++++ b/src/services/chat/history/zipReader.ts
+@@ -1,4 +1,13 @@
+ import { Inflate } from 'fflate'
++import { readCachedRange, type CachedArchiveFile } from './nativeCache.js'
++
++/**
++ * 归档来源：网页端为用户选择的 File（可能挂在 content:// 管道上）；
++ * APK 内大文件走原生拷贝后的沙箱真实文件（CachedArchiveFile）。
++ */
++export type ZipSource = File | CachedArchiveFile
++
++const sizeOf = (source: ZipSource): number => source.size
+ 
+ const READ_CHUNK_BYTES = 256 * 1024
+ // 控制每轮同步解压的工作量；输出交给调用方保存后才继续读取。
+@@ -17,13 +26,24 @@ const invalid = (): never => {
+ }
+ 
+ /** 本地文件头签名 PK\x03\x04，用于在解析前区分 ZIP 与其他文件。 */
+-export const isZipFile = async (file: File) => {
+-  const bytes = new Uint8Array(await file.slice(0, 4).arrayBuffer())
++export const isZipFile = async (source: ZipSource) => {
++  const bytes = await readBytes(source, 0, 4)
+   return bytes.length === 4 && bytes.every((byte, index) => byte === [0x50, 0x4b, 3, 4][index])
+ }
+ 
+ const viewOf = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+ 
++/** 整读缓存：同一 File 只读一次内存（导入流程内 File 生命周期短，WeakMap 足够） */
++const bufferOf = (file: File): Promise<ArrayBuffer> => {
++  let promise = bufferCache.get(file)
++  if (!promise) {
++    promise = file.arrayBuffer()
++    bufferCache.set(file, promise)
++  }
++  return promise
++}
++const bufferCache = new WeakMap<File, Promise<ArrayBuffer>>()
++
+ const crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
+   let crc = value
+   for (let bit = 0; bit < 8; bit++) {
+@@ -32,10 +52,29 @@ const crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
+   return crc >>> 0
+ })
+ 
+-const readBytes = async (file: File, start: number, length: number) => {
+-  if (start < 0 || length < 0 || start + length > file.size) {
++const readBytes = async (
++  source: ZipSource,
++  start: number,
++  length: number
++): Promise<Uint8Array<ArrayBuffer>> => {
++  if (start < 0 || length < 0 || start + length > sizeOf(source)) {
+     invalid()
+   }
++  if ('kind' in source && source.kind === 'cache') {
++    // 沙箱真实文件：走原生 readRange，随机访问没有管道重读问题。
++    return await readCachedRange(source.path, start, length)
++  }
++  const file = source as File
++  // 随机访问在 Android WebView 的 content:// 管道文件上会退化为 O(n²) 重读；
++  // 不超过阈值时整读一次进内存，用零拷贝视图切片代替（zipReader 的访问全程只读）。
++  if (file.size <= 400 * 1024 * 1024) {
++    const buffer = await bufferOf(file)
++    const bytes = new Uint8Array(buffer, start, length)
++    if (bytes.length !== length) {
++      invalid()
++    }
++    return bytes
++  }
+   const bytes = new Uint8Array(await file.slice(start, start + length).arrayBuffer())
+   if (bytes.length !== length) {
+     invalid()
+@@ -85,12 +124,12 @@ type Entry = {
+   offset: number
+ }
+ 
+-const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: number }> => {
+-  if (file.size < 22) {
++const readDirectory = async (source: ZipSource): Promise<{ entries: Entry[]; offset: number }> => {
++  if (sizeOf(source) < 22) {
+     invalid()
+   }
+-  const tailStart = Math.max(0, file.size - 22 - 0xffff)
+-  const tail = await readBytes(file, tailStart, file.size - tailStart)
++  const tailStart = Math.max(0, sizeOf(source) - 22 - 0xffff)
++  const tail = await readBytes(source, tailStart, sizeOf(source) - tailStart)
+   const tailView = viewOf(tail)
+   let end = tail.length - 22
+   while (
+@@ -124,7 +163,7 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
+     if (cursor + 46 > size) {
+       invalid()
+     }
+-    const view = viewOf(await readBytes(file, offset + cursor, 46))
++    const view = viewOf(await readBytes(source, offset + cursor, 46))
+     if (view.getUint32(0, true) !== 0x02014b50) {
+       invalid()
+     }
+@@ -150,7 +189,7 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
+     ) {
+       invalid()
+     }
+-    const name = await readBytes(file, offset + cursor + 46, nameLength)
++    const name = await readBytes(source, offset + cursor + 46, nameLength)
+     const path = decodePath(name, flags)
+     // 目录和同名文件也不能互相覆盖。
+     const identity = path.endsWith('/') ? path.slice(0, -1) : path
+@@ -158,7 +197,7 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
+       invalid()
+     }
+     paths.add(identity)
+-    checkExtra(await readBytes(file, offset + cursor + 46 + nameLength, extraLength))
++    checkExtra(await readBytes(source, offset + cursor + 46 + nameLength, extraLength))
+     entries.push({
+       path,
+       name,
+@@ -177,11 +216,11 @@ const readDirectory = async (file: File): Promise<{ entries: Entry[]; offset: nu
+   return { entries: entries.sort((a, b) => a.offset - b.offset), offset }
+ }
+ 
+-const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
++const readEntryOffset = async (source: ZipSource, entry: Entry, boundary: number) => {
+   if (entry.offset + 30 > boundary) {
+     invalid()
+   }
+-  const view = viewOf(await readBytes(file, entry.offset, 30))
++  const view = viewOf(await readBytes(source, entry.offset, 30))
+   const nameLength = view.getUint16(26, true)
+   const extraLength = view.getUint16(28, true)
+   const start = entry.offset + 30 + nameLength + extraLength
+@@ -205,7 +244,7 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
+       invalid()
+     }
+   }
+-  const metadata = await readBytes(file, entry.offset + 30, nameLength + extraLength)
++  const metadata = await readBytes(source, entry.offset + 30, nameLength + extraLength)
+   if (entry.name.some((byte, index) => byte !== metadata[index])) {
+     invalid()
+   }
+@@ -214,7 +253,7 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
+     if (end + 12 > boundary) {
+       invalid()
+     }
+-    const descriptor = viewOf(await readBytes(file, end, Math.min(16, boundary - end)))
++    const descriptor = viewOf(await readBytes(source, end, Math.min(16, boundary - end)))
+     const shift = descriptor.getUint32(0, true) === 0x08074b50 ? 4 : 0
+     if (
+       shift + 12 > descriptor.byteLength ||
+@@ -231,6 +270,9 @@ const readEntryOffset = async (file: File, entry: Entry, boundary: number) => {
+ export type ArchiveEntry = {
+   path: string
+   size: number
++  /** 条目数据区在文件中的起始偏移与结束边界（下一数据区起点或中央目录起点），用于导入进度显示 */
++  offset: number
++  end: number
+   stream: AsyncIterable<Uint8Array>
+ }
+ 
+@@ -238,11 +280,11 @@ export type ArchiveEntry = {
+  * 按条目在文件中的物理顺序逐条、逐块解压，跳过目录条目。
+  * 调用方必须消费完当前条目的数据，再请求下一个条目。
+  */
+-export async function* readArchive(file: File): AsyncGenerator<ArchiveEntry> {
+-  const directory = await readDirectory(file)
++export async function* readArchive(source: ZipSource): AsyncGenerator<ArchiveEntry> {
++  const directory = await readDirectory(source)
+   for (const [index, entry] of directory.entries.entries()) {
+     const boundary = directory.entries[index + 1]?.offset ?? directory.offset
+-    const start = await readEntryOffset(file, entry, boundary)
++    const start = await readEntryOffset(source, entry, boundary)
+     if (entry.path.endsWith('/')) {
+       continue
+     }
+@@ -264,34 +306,73 @@ export async function* readArchive(file: File): AsyncGenerator<ArchiveEntry> {
+         }
+       }
+       const inflate = entry.method === 8 ? new Inflate(append) : null
+-      for (let offset = 0; offset < entry.compressedSize; offset += READ_CHUNK_BYTES) {
+-        const chunk = await readBytes(
+-          file,
+-          start + offset,
+-          Math.min(READ_CHUNK_BYTES, entry.compressedSize - offset)
+-        )
+-        if (!inflate) {
+-          append(chunk)
+-          yield* pending.splice(0)
+-          continue
++      const nativeInflate =
++        entry.method === 8 && typeof DecompressionStream === 'function'
++          ? new DecompressionStream('deflate-raw')
++          : null
++      if (nativeInflate) {
++        // 原生 inflate：并行喂入压缩数据，输出按需拉取；消费端异步写入期间解压自然暂停。
++        // 未拉取的输出最多缓冲到单条目大小（导入流程中最大为一张图片原件），可接受。
++        const reader = nativeInflate.readable.getReader()
++        const writer = nativeInflate.writable.getWriter()
++        const pumping = (async () => {
++          try {
++            for (let offset = 0; offset < entry.compressedSize; offset += READ_CHUNK_BYTES) {
++              const chunk = await readBytes(
++                source,
++                start + offset,
++                Math.min(READ_CHUNK_BYTES, entry.compressedSize - offset)
++              )
++              await writer.write(chunk)
++            }
++          } finally {
++            await writer.close().catch(() => {})
++          }
++        })()
++        try {
++          for (;;) {
++            const { done, value } = await reader.read()
++            if (done) {
++              break
++            }
++            append(value)
++            yield* pending.splice(0)
++          }
++          await pumping
++        } catch (error) {
++          void pumping.catch(() => {})
++          throw error
++        }
++      } else {
++        for (let offset = 0; offset < entry.compressedSize; offset += READ_CHUNK_BYTES) {
++          const chunk = await readBytes(
++            source,
++            start + offset,
++            Math.min(READ_CHUNK_BYTES, entry.compressedSize - offset)
++          )
++          if (!inflate) {
++            append(chunk)
++            yield* pending.splice(0)
++            continue
++          }
++          for (let cursor = 0; cursor < chunk.length; cursor += INFLATE_CHUNK_BYTES) {
++            const end = Math.min(cursor + INFLATE_CHUNK_BYTES, chunk.length)
++            inflate.push(chunk.subarray(cursor, end), offset + end === entry.compressedSize)
++            // yield 暂停解压，等待调用方完成异步写入；不缓存整个条目。
++            yield* pending.splice(0)
++          }
+         }
+-        for (let cursor = 0; cursor < chunk.length; cursor += INFLATE_CHUNK_BYTES) {
+-          const end = Math.min(cursor + INFLATE_CHUNK_BYTES, chunk.length)
+-          inflate.push(chunk.subarray(cursor, end), offset + end === entry.compressedSize)
+-          // yield 暂停解压，等待调用方完成异步写入；不缓存整个条目。
++        if (inflate && entry.compressedSize === 0) {
++          inflate.push(new Uint8Array(), true)
+           yield* pending.splice(0)
+         }
+       }
+-      if (inflate && entry.compressedSize === 0) {
+-        inflate.push(new Uint8Array(), true)
+-        yield* pending.splice(0)
+-      }
+       if (written !== entry.size || (crc ^ 0xffffffff) >>> 0 !== entry.crc) {
+         invalid()
+       }
+       completed = true
+     }
+-    yield { path: entry.path, size: entry.size, stream: stream() }
++    yield { path: entry.path, size: entry.size, offset: start, end: boundary, stream: stream() }
+     if (!completed) {
+       invalid()
+     }
